@@ -5,7 +5,7 @@ import sys
 from open3d import io,utility,visualization,geometry
 import math
 
-pi = math.pi
+PI = math.pi
 
 def read_file(fname):
     pcd = io.read_point_cloud(fname)
@@ -31,8 +31,8 @@ def view_mesh(points,faces):
     faces - np.uint16 
     '''
     mesh=geometry.TriangleMesh()
-    mesh.vertices=Vector3dVector(points)
-    mesh.triangles=Vector3iVector(faces)
+    mesh.vertices=utility.Vector3dVector(points)
+    mesh.triangles=utility.Vector3iVector(faces)
     mesh.compute_vertex_normals()
     mesh.paint_uniform_color([1, 0.706, 0])
     visualization.draw_geometries([mesh])
@@ -81,7 +81,6 @@ def get_neighbors(points, pi, mu, adj_points, face_normals, adj_faces, boundary_
     nn_idx = np.flatnonzero(np.logical_and(dist_all > 0, dist_all <= prune_dist))
     nn_p = points[nn_idx]
 
-    print('nn_idx',nn_idx)
     # get local plane
     if len(adj_faces) > 0:
         # if have incident triangles, use avg face normal
@@ -115,7 +114,6 @@ def get_neighbors(points, pi, mu, adj_points, face_normals, adj_faces, boundary_
                 visible[j] = False
     nn_idx = nn_idx[visible]
     nn_p_uv = nn_p_uv[visible]
-    print('nn_idx2',nn_idx)
     visible = np.ones((len(nn_idx),), dtype=bool)
     # then find all boundary edges close to p
     for edge in boundary_edges:
@@ -131,18 +129,18 @@ def get_neighbors(points, pi, mu, adj_points, face_normals, adj_faces, boundary_
             p2_plane = (p2-p) - np.dot((p2-p),normal) * normal
             p2_uv = np.asarray([np.dot(p2_plane,basis1), np.dot(p2_plane,basis2)])
             for k in range(len(nn_idx)):
+                if nn_idx[k] == edge[0] or nn_idx[k] == edge[1]:
+                    continue
                 np_uv = nn_p_uv[k]
                 if visible[k] == True and check_intersect(p1_uv,p2_uv,np.array([0,0]),np_uv): # p in uv-coord is (0,0)
+                    #print("intersection! p1uv,p2uv,np_uv,p1,p2",p1_uv,p2_uv,np_uv,edge,nn_idx[k])
                     visible[k] = False
     nn_idx = nn_idx[visible]
     nn_p_uv = nn_p_uv[visible]
-    print('nn_idx3',nn_idx)
 
     # order the neighbors counterclockwise
     nn_p_rad = np.arctan2(nn_p_uv[:,1], nn_p_uv[:,0])
-    nn_p_rad += (nn_p_uv[:,0] < 0).astype(np.float32) * pi # get angles bw point and u-axis
     sort_idx = np.argsort(nn_p_rad)
-    print("sort idx", sort_idx)
     nn_idx = nn_idx[sort_idx]
     nn_p_uv = nn_p_uv[sort_idx]
 
@@ -182,12 +180,18 @@ def triangulate(points, mu):
     frontier = [0] 
 
     while len(frontier) > 0:
+        '''
+        if len(faces) > 0:
+            view_mesh(points, np.asarray(faces, dtype = np.uint16))
+            '''
         i = frontier.pop(0) # bfs
+        print('i',i)
+        #print('num boundary edge',len(boundary_edges))
         if i in visited:
             continue
         p = points[i]
         nn_idx, nn_p_uv = get_neighbors(points, i, mu, adj_points[i], face_normals, adj_faces[i], boundary_edges)
-        if len(nn_idx)>2:
+        if len(nn_idx)>1:
             nn_idx = np.concatenate([nn_idx, nn_idx[0:1]],axis=0) # make it a cycle
             nn_p_uv = np.concatenate([nn_p_uv, nn_p_uv[0:1]],axis=0) # make it a cycle
         # triangulate
@@ -200,11 +204,11 @@ def triangulate(points, mu):
                 frontier.append(ni)
             npo = points[ni]
             ne = get_edge(ni, i)
-            print("i,ni",i,ni)
-            if len(nn_idx)>2:
+            #print("i,ni,uv",i,ni,nn_p_uv[j])
+            if len(nn_idx)>1:
                 if j<len(nn_idx)-1:
                     assert ne not in is_boundary or is_boundary[ne] == True, "current edge cannot be completed"
-                elif is_boundary[ne] == False:
+                elif ne in is_boundary and is_boundary[ne] == False:
                     continue
             # if it is a new edge, we add to adj list 
             if ni not in adj_points[i]:
@@ -218,10 +222,14 @@ def triangulate(points, mu):
             # if last edge exists and is not completed
             if last_edge is not None and (last_edge not in is_boundary or is_boundary[last_edge] == True):
                 # check if the current edge already has a face to the cw side
+                # and if last edge has a face to the ccw side
                 has_face = False
                 for fi in adj_faces[i]:
                     face = faces[fi]
                     if check_cw_face(face, i, ni):
+                        has_face = True
+                        break
+                    if check_cw_face(face, last_ni, i):
                         has_face = True
                         break
                 if has_face:
@@ -287,4 +295,5 @@ if __name__ == "__main__":
     mu = 1.5
     points = read_file("bunny.ply")
     faces = triangulate(points, mu)
+    np.save("bunny_faces",faces)
     view_mesh(points, faces)
