@@ -9,7 +9,7 @@ PI = math.pi
 
 def read_file(fname):
     pcd = io.read_point_cloud(fname)
-    #visualization.draw_geometries([pcd])
+    visualization.draw_geometries([pcd])
     points = np.asarray(pcd.points)
     return points
 
@@ -51,19 +51,28 @@ def check_intersect(p1, p2, q1, q2):
     # check if two line segments on 2d intersect
     return ccw(p1,q1,q2) != ccw(p2,q1,q2) and ccw(p1,p2,q1) != ccw(p1,p2,q2)
 
-def get_neighbors(points, pi, mu, adj_points, face_normals, adj_faces, boundary_edges):
+def get_oppo_edge(face,pi):
+    face_set = set(face)
+    face_set.remove(pi)
+    rem = list(face_set)
+    return get_edge(rem[0],rem[1])
+
+def get_neighbors(points, pi, mu, adj_points_all, faces, face_normals, adj_faces_all, boundary_edges):
     '''
     points - n x 3
     pi - idx of p
     mu - scalar
-    adj_points - k, indices of vertices, already confirmed edges
+    adj_points_all - indices of adj vertices, already confirmed edges
+    faces - already constructed faces
     face_normals - m x 3, float
-    adj_faces, indices of already constructed faces incident to p
+    adj_faces_all, indices of already constructed faces of every point
     boundary_edges - boundary edges in the entire shape
     return
     nn_idx - ordered by angle in counterclockwise, pruned by distance and visibility 
     '''
     p = points[pi]
+    adj_points = adj_points_all[pi]
+    adj_faces = adj_faces_all[pi]
     # get minimal distance
     dist_all = ((points-p[None,:])**2).sum(axis=1)**0.5 # n
     if len(adj_points)>0:
@@ -97,6 +106,11 @@ def get_neighbors(points, pi, mu, adj_points, face_normals, adj_faces, boundary_
 
     # project to local plane
     nn_p_rel = nn_p-p[None,:] # relative nn position
+    if len(adj_faces) == 0:
+        test_convex = (nn_p_rel @ normal[:,None]).sum()
+        if test_convex > 0:
+            normal *= -1
+        normal *= -1
     basis1 = np.cross(normal, nn_p_rel[0]) # randomly choose a basis
     basis2 = np.cross(normal, basis1)
     basis1 /= np.linalg.norm(basis1)
@@ -115,26 +129,41 @@ def get_neighbors(points, pi, mu, adj_points, face_normals, adj_faces, boundary_
     nn_idx = nn_idx[visible]
     nn_p_uv = nn_p_uv[visible]
     visible = np.ones((len(nn_idx),), dtype=bool)
-    # then find all boundary edges close to p
-    for edge in boundary_edges:
+    # then find all blocking edges to test
+    block_edges = set()
+    for fi in adj_faces:
+        face = faces[fi]
+        block_edges.add(get_oppo_edge(face,pi))
+    for api in adj_points:
+        if get_edge(api,pi) in boundary_edges:
+            block_edges.add(get_edge(api,pi))
+    for ni in nn_idx:
+        ni = ni.item()
+        n_adj_faces = adj_faces_all[ni]
+        for fi in n_adj_faces:
+            face = faces[fi]
+            block_edges.add(get_oppo_edge(face,ni))
+        n_adj_points = adj_points_all[ni]
+        for npi in n_adj_points:
+            if get_edge(npi, ni) in boundary_edges:
+                block_edges.add(get_edge(npi, ni))
+    for edge in block_edges:
         p1 = points[edge[0]]
         p2 = points[edge[1]]
         if pi == edge[0] or pi == edge[1]:
             continue
-        dist = np.linalg.norm(np.cross(p-p1,p-p2)) / np.linalg.norm(p2-p1) # distance from edge to p
-        if dist < prune_dist:
-            # project edge to plane
-            p1_plane = (p1-p) - np.dot((p1-p),normal) * normal
-            p1_uv = np.asarray([np.dot(p1_plane,basis1), np.dot(p1_plane,basis2)])
-            p2_plane = (p2-p) - np.dot((p2-p),normal) * normal
-            p2_uv = np.asarray([np.dot(p2_plane,basis1), np.dot(p2_plane,basis2)])
-            for k in range(len(nn_idx)):
-                if nn_idx[k] == edge[0] or nn_idx[k] == edge[1]:
-                    continue
-                np_uv = nn_p_uv[k]
-                if visible[k] == True and check_intersect(p1_uv,p2_uv,np.array([0,0]),np_uv): # p in uv-coord is (0,0)
-                    #print("intersection! p1uv,p2uv,np_uv,p1,p2",p1_uv,p2_uv,np_uv,edge,nn_idx[k])
-                    visible[k] = False
+        # project edge to plane
+        p1_plane = (p1-p) - np.dot((p1-p),normal) * normal
+        p1_uv = np.asarray([np.dot(p1_plane,basis1), np.dot(p1_plane,basis2)])
+        p2_plane = (p2-p) - np.dot((p2-p),normal) * normal
+        p2_uv = np.asarray([np.dot(p2_plane,basis1), np.dot(p2_plane,basis2)])
+        for k in range(len(nn_idx)):
+            if nn_idx[k] == edge[0] or nn_idx[k] == edge[1]:
+                continue
+            np_uv = nn_p_uv[k]
+            if visible[k] == True and check_intersect(p1_uv,p2_uv,np.array([0,0]),np_uv): # p in uv-coord is (0,0)
+                #print("intersection! p1uv,p2uv,np_uv,p1,p2",p1_uv,p2_uv,np_uv,edge,nn_idx[k])
+                visible[k] = False
     nn_idx = nn_idx[visible]
     nn_p_uv = nn_p_uv[visible]
 
@@ -167,6 +196,7 @@ def triangulate(points, mu):
     faces - m x 3, np.uint16, indices of vertices
     '''
     faces = list()
+    faces_set = set()
     face_normals = list()
     n = points.shape[0]
 
@@ -178,19 +208,22 @@ def triangulate(points, mu):
 
     visited = set()
     frontier = [0] 
+    rem = set(range(n))
 
-    while len(frontier) > 0:
+    while len(frontier) > 0 or len(rem)>0:
         '''
         if len(faces) > 0:
             view_mesh(points, np.asarray(faces, dtype = np.uint16))
             '''
-        i = frontier.pop(0) # bfs
+        if len(frontier)==0:
+            i = rem.pop()
+        else:
+            i = frontier.pop(0) # bfs
         print('i',i)
-        #print('num boundary edge',len(boundary_edges))
         if i in visited:
             continue
         p = points[i]
-        nn_idx, nn_p_uv = get_neighbors(points, i, mu, adj_points[i], face_normals, adj_faces[i], boundary_edges)
+        nn_idx, nn_p_uv = get_neighbors(points, i, mu, adj_points, faces, face_normals, adj_faces, boundary_edges)
         if len(nn_idx)>1:
             nn_idx = np.concatenate([nn_idx, nn_idx[0:1]],axis=0) # make it a cycle
             nn_p_uv = np.concatenate([nn_p_uv, nn_p_uv[0:1]],axis=0) # make it a cycle
@@ -243,7 +276,16 @@ def triangulate(points, mu):
                     last_edge = ne
                     last_ni = ni
                     continue
+                # check if a face of the other orientation exists
+                if tuple(sorted(nf)) in faces_set:
+                    last_edge = ne
+                    last_ni = ni
+                    continue
+                faces_set.add(tuple(sorted(nf)))
                 # add faces, edges, etc to the lists
+                oppo_edge = get_edge(last_ni, ni)
+                adj_points[ni].add(last_ni)
+                adj_points[last_ni].add(ni)
                 faces.append(nf)
                 adj_faces[i].add(len(faces)-1)
                 adj_faces[ni].add(len(faces)-1)
@@ -251,9 +293,6 @@ def triangulate(points, mu):
                 fnormal = np.cross(points[last_ni]-p,npo-p) # get face normal
                 fnormal /= np.linalg.norm(fnormal) # normalize
                 face_normals.append(fnormal)
-                oppo_edge = get_edge(last_ni, ni)
-                adj_points[ni].add(last_ni)
-                adj_points[last_ni].add(ni)
                 # check edges still boundary or not
                 if oppo_edge in is_boundary:
                     if is_boundary[oppo_edge]==True:
@@ -261,6 +300,9 @@ def triangulate(points, mu):
                         boundary_edges.remove(oppo_edge)
                     else:
                         print("dup edge!1")
+                        last_edge = ne
+                        last_ni = ni
+                        continue
                 else:
                     is_boundary[oppo_edge] = True
                     boundary_edges.add(oppo_edge)
@@ -270,6 +312,9 @@ def triangulate(points, mu):
                         boundary_edges.remove(last_edge)
                     else:
                         print("dup edge!2")
+                        last_edge = ne
+                        last_ni = ni
+                        continue
                 else:
                     is_boundary[last_edge] = True
                     boundary_edges.add(last_edge)
@@ -279,6 +324,9 @@ def triangulate(points, mu):
                         boundary_edges.remove(ne)
                     else:
                         print("dup edge!3")
+                        last_edge = ne
+                        last_ni = ni
+                        continue
                 else:
                     is_boundary[ne] = True
                     boundary_edges.add(ne)
@@ -287,13 +335,19 @@ def triangulate(points, mu):
             last_ni = ni
 
         visited.add(i)
+        if i in rem:
+            rem.remove(i)
 
     return np.asarray(faces, dtype = np.uint16)
 
 
 if __name__ == "__main__":
-    mu = 1.5
-    points = read_file("bunny.ply")
-    faces = triangulate(points, mu)
-    np.save("bunny_faces",faces)
+    mu = 2
+    model_name = "bunny_high"
+    points = read_file(model_name+".ply")
+    if os.path.exists(model_name+str(mu)+'.npy'):
+        faces = np.load(model_name+str(mu)+'.npy')
+    else:
+        faces = triangulate(points, mu)
+        np.save(model_name+str(mu),faces)
     view_mesh(points, faces)
